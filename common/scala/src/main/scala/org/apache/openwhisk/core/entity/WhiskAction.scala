@@ -40,6 +40,7 @@ import org.apache.openwhisk.core.entity.types.EntityStore
  * limit optional so that it is convenient to override just one limit at a time.
  */
 case class ActionLimitsOption(timeout: Option[TimeLimit],
+                              gpu: Option[GpuLimit],
                               memory: Option[MemoryLimit],
                               logs: Option[LogLimit],
                               concurrency: Option[ConcurrencyLimit])
@@ -587,7 +588,7 @@ object WhiskActionMetaData
 }
 
 object ActionLimitsOption extends DefaultJsonProtocol {
-  implicit val serdes = jsonFormat4(ActionLimitsOption.apply)
+  implicit val serdes = jsonFormat5(ActionLimitsOption.apply)
 }
 
 object WhiskActionPut extends DefaultJsonProtocol {

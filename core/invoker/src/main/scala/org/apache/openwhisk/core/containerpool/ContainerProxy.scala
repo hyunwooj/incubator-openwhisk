@@ -34,6 +34,7 @@ import org.apache.openwhisk.core.connector.ActivationMessage
 import org.apache.openwhisk.core.containerpool.logging.LogCollectingException
 import org.apache.openwhisk.core.database.UserContext
 import org.apache.openwhisk.core.entity.ExecManifest.ImageName
+import org.apache.openwhisk.core.entity.GpuId
 import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.core.entity.size._
 import org.apache.openwhisk.core.invoker.InvokerReactive.ActiveAck
@@ -69,17 +70,20 @@ case class WarmedData(container: Container,
                       invocationNamespace: EntityName,
                       action: ExecutableWhiskAction,
                       override val lastUsed: Instant,
-                      override val activeActivationCount: Int = 0)
+                      override val activeActivationCount: Int = 0,
+                      gpusToUse: IndexedSeq[GpuId],
+                      gpusToReturn: IndexedSeq[GpuId])
     extends ContainerData(lastUsed, action.limits.memory.megabytes.MB) {
-  def incrementActive: WarmedData =
-    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount + 1)
+  def incrementActive(gpusToUse: IndexedSeq[GpuId]): WarmedData =
+    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount + 1, gpusToUse, IndexedSeq.empty[GpuId])
   def decrementActive: WarmedData =
-    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount - 1)
+    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount - 1, IndexedSeq.empty[GpuId], gpusToUse)
 }
 
 // Events received by the actor
 case class Start(exec: CodeExec[_], memoryLimit: ByteSize)
-case class Run(action: ExecutableWhiskAction, msg: ActivationMessage, retryLogDeadline: Option[Deadline] = None)
+case class Run(action: ExecutableWhiskAction, msg: ActivationMessage, retryLogDeadline: Option[Deadline] = None,
+               gpuIds: IndexedSeq[GpuId] = IndexedSeq.empty[GpuId])
 case object Remove
 
 // Events sent by the actor
@@ -270,7 +274,7 @@ class ContainerProxy(
         if stateData.activeActivationCount < data.action.limits.concurrency.maxConcurrent && !rescheduleJob => //if there was a delay, and not a failure on resume, skip the run
 
       implicit val transid = job.msg.transid
-      val newData = data.incrementActive
+      val newData = data.incrementActive(job.gpuIds)
 
       initializeAndRun(data.container, job)
         .map(_ => RunCompleted)
@@ -295,7 +299,7 @@ class ContainerProxy(
   when(Ready, stateTimeout = pauseGrace) {
     case Event(job: Run, data: WarmedData) =>
       implicit val transid = job.msg.transid
-      val newData = data.incrementActive
+      val newData = data.incrementActive(job.gpuIds)
 
       initializeAndRun(data.container, job)
         .map(_ => RunCompleted)
@@ -320,7 +324,7 @@ class ContainerProxy(
   when(Paused, stateTimeout = unusedTimeout) {
     case Event(job: Run, data: WarmedData) =>
       implicit val transid = job.msg.transid
-      val newData = data.incrementActive
+      val newData = data.incrementActive(job.gpuIds)
 
       data.container
         .resume()
@@ -457,19 +461,21 @@ class ContainerProxy(
       .flatMap { initInterval =>
         //immediately setup warmedData for use (before first execution) so that concurrent actions can use it asap
         if (initInterval.isDefined) {
-          self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1))
+          self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1, job.gpuIds, IndexedSeq.empty[GpuId]))
         }
         val parameters = job.msg.content getOrElse JsObject.empty
 
         val authEnvironment = job.msg.user.authkey.toEnvironment
 
         val environment = JsObject(
+          "cuda_visible_devices" -> job.gpuIds.mkString(",").toJson,
           "namespace" -> job.msg.user.namespace.name.toJson,
           "action_name" -> job.msg.action.qualifiedNameWithLeadingSlash.toJson,
           "activation_id" -> job.msg.activationId.toString.toJson,
           // compute deadline on invoker side avoids discrepancies inside container
           // but potentially under-estimates actual deadline
           "deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)
+        logging.info(this, s"environment: ${environment.toString}")
 
         container
           .run(

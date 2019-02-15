@@ -24,6 +24,7 @@ import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.core.entity.size._
 
 import scala.collection.immutable
+import scala.collection.immutable.Queue
 import scala.concurrent.duration._
 import scala.util.Try
 
@@ -79,6 +80,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     }
   }
 
+  var gpuPool = immutable.Queue.empty[GpuId]
+  (0 until poolConfig.numGpus).map { gpuId: Int =>
+    gpuPool = gpuPool.enqueue(GpuId(gpuId))
+  }
+
   def logContainerStart(r: Run, containerState: String, activeActivations: Int): Unit = {
     val namespaceName = r.msg.user.namespace.name
     val actionName = r.action.name.name
@@ -108,7 +114,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
       if (runBuffer.isEmpty || isResentFromBuffer) {
         val createdContainer =
           // Is there enough space on the invoker for this action to be executed.
-          if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
+          if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)
+              && hasPoolGpusFor(gpuPool, r.action)) {
             // Schedule a job to a warm container
             ContainerPool
               .schedule(r.action, r.msg.user.namespace.name, freePool)
@@ -158,8 +165,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               runBuffer = newBuffer
               runBuffer.dequeueOption.foreach { case (run, _) => self ! run }
             }
-            actor ! r // forwards the run request to the container
-            logContainerStart(r, containerState, data.activeActivationCount)
+            val runGpu = {
+              val gpuIds = (0 until r.action.limits.gpu.count).map(_ => {
+                val (gpuId, newGpuPool) = gpuPool.dequeue
+                logging.info(this, s"gpuPool dequeue ${gpuId}: ${gpuPool}")
+                gpuPool = newGpuPool
+                gpuId
+              })
+              Run(r.action, r.msg, r.retryLogDeadline, gpuIds)
+            }
+            actor ! runGpu // forwards the run request to the container
+            logContainerStart(runGpu, containerState, data.activeActivationCount)
           case None =>
             // this can also happen if createContainer fails to start a new container, or
             // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
@@ -169,11 +185,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               logging.error(
                 this,
                 s"Rescheduling Run message, too many message in the pool, " +
-                  s"freePoolSize: ${freePool.size} containers and ${memoryConsumptionOf(freePool)} MB, " +
-                  s"busyPoolSize: ${busyPool.size} containers and ${memoryConsumptionOf(busyPool)} MB, " +
-                  s"maxContainersMemory ${poolConfig.userMemory.toMB} MB, " +
+                  s"freePool + busyPool / limit: ${freePool.size} (${memoryConsumptionOf(freePool)} MB) + " +
+                  s"${busyPool.size} (${memoryConsumptionOf(busyPool)} MB)" +
+                  s" / ${poolConfig.userMemory.toMB} MB, " +
                   s"userNamespace: ${r.msg.user.namespace.name}, action: ${r.action}, " +
                   s"needed memory: ${r.action.limits.memory.megabytes} MB, " +
+                  s"gpuPool: ${gpuPool}, " +
                   s"waiting messages: ${runBuffer.size}")(r.msg.transid)
               Some(logMessageInterval.fromNow)
             } else {
@@ -195,6 +212,14 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     // Container is free to take more work
     case NeedWork(data: WarmedData) =>
       feed ! MessageFeed.Processed
+      logging.info(this, s"NeedWork data.gpuToUse: ${data.gpusToUse}")
+      logging.info(this, s"NeedWork data.gpuToReturn: ${data.gpusToReturn}")
+      logging.info(this, s"data.activeActivationCount ${data.activeActivationCount}")
+      logging.info(this, s"data.action.limits.concurrency.maxConcurrent: ${data.action.limits.concurrency.maxConcurrent}")
+      data.gpusToReturn.foreach(gpuId => {
+        gpuPool = gpuPool.enqueue(gpuId)
+        logging.info(this, s"gpuPool enqueue ${gpuId}: ${gpuPool}")
+      })
       if (data.activeActivationCount < data.action.limits.concurrency.maxConcurrent) {
         //remove from busy pool (may already not be there), put back into free pool (to update activation counts)
         freePool = freePool + (sender() -> data)
@@ -310,6 +335,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   def hasPoolSpaceFor[A](pool: Map[A, ContainerData], memory: ByteSize): Boolean = {
     memoryConsumptionOf(pool) + memory.toMB <= poolConfig.userMemory.toMB
   }
+
+  /**
+    * Calculate if there is enough GPUs within a given pool.
+    *
+    * @param pool The pool, that has to be checked, if there is enough GPUs.
+    * @param gpus The number of GPUs to check.
+    * @return true, if there is enough GPUs for the given number of GPUs.
+    */
+  def hasPoolGpusFor[A](pool: Queue[A], action: ExecutableWhiskAction): Boolean = {
+      pool.size >= action.limits.gpu.count
+  }
 }
 
 object ContainerPool {
@@ -343,7 +379,7 @@ object ContainerPool {
                                            invocationNamespace: EntityName,
                                            idles: Map[A, ContainerData]): Option[(A, ContainerData)] = {
     idles.find {
-      case (_, WarmedData(_, `invocationNamespace`, `action`, _, activeActivationCount))
+      case (_, WarmedData(_, `invocationNamespace`, `action`, _, activeActivationCount, _, _))
           if activeActivationCount < action.limits.concurrency.maxConcurrent =>
         true
       case _ => false

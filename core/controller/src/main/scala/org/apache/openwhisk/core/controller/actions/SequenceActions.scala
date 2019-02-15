@@ -199,7 +199,7 @@ protected[actions] trait SequenceActions {
     val sequenceLimits = accounting.maxMemory map { maxMemoryAcrossActionsInSequence =>
       Parameters(
         WhiskActivation.limitsAnnotation,
-        ActionLimits(action.limits.timeout, MemoryLimit(maxMemoryAcrossActionsInSequence MB), action.limits.logs).toJson)
+        ActionLimits(action.limits.timeout, GpuLimit(), MemoryLimit(maxMemoryAcrossActionsInSequence MB), action.limits.logs).toJson) // TODO: Not sure what GpuLimmit should be
     }
 
     // set causedBy if not topmost sequence

@@ -532,7 +532,7 @@ protected[actions] trait PrimitiveActions {
     // compute max memory
     val sequenceLimits = Parameters(
       WhiskActivation.limitsAnnotation,
-      ActionLimits(session.action.limits.timeout, MemoryLimit(session.maxMemory), session.action.limits.logs).toJson)
+      ActionLimits(session.action.limits.timeout, GpuLimit(), MemoryLimit(session.maxMemory), session.action.limits.logs).toJson) // TODO: Not sure what GpuLimit should be
 
     // set causedBy if not topmost
     val causedBy = session.cause.map { _ =>

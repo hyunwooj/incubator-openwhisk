@@ -171,3 +171,7 @@ trait SizeConversion {
 
   def sizeIn(unit: SizeUnits.Unit): ByteSize
 }
+
+case class GpuId(value: Int) {
+  override def toString: String = String.valueOf(value)
+}
