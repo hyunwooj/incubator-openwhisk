@@ -71,13 +71,16 @@ case class WarmedData(container: Container,
                       action: ExecutableWhiskAction,
                       override val lastUsed: Instant,
                       override val activeActivationCount: Int = 0,
-                      gpusToUse: IndexedSeq[GpuId],
-                      gpusToReturn: IndexedSeq[GpuId])
+                      gpuIds: IndexedSeq[GpuId])
     extends ContainerData(lastUsed, action.limits.memory.megabytes.MB) {
-  def incrementActive(gpusToUse: IndexedSeq[GpuId]): WarmedData =
-    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount + 1, gpusToUse, IndexedSeq.empty[GpuId])
+  def incrementActive(gpuIds: IndexedSeq[GpuId]): WarmedData =
+    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount + 1, gpuIds)
   def decrementActive: WarmedData =
-    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount - 1, IndexedSeq.empty[GpuId], gpusToUse)
+    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount - 1, gpuIds)
+
+  override def toString: String = {
+    super.toString + s", gpuIds: ${gpuIds}"
+  }
 }
 
 // Events received by the actor
@@ -87,7 +90,7 @@ case class Run(action: ExecutableWhiskAction, msg: ActivationMessage, retryLogDe
 case object Remove
 
 // Events sent by the actor
-case class NeedWork(data: ContainerData)
+case class NeedWork(data: ContainerData, justInitialized: Boolean = false)
 case object ContainerPaused
 case object ContainerRemoved // when container is destroyed
 case object RescheduleJob // job is sent back to parent and could not be processed because container is being destroyed
@@ -253,7 +256,7 @@ class ContainerProxy(
     // Init was successful
     case Event(completed: InitCompleted, _: PreWarmedData) =>
       //in case concurrency supported, multiple runs can begin as soon as init is complete
-      context.parent ! NeedWork(completed.data)
+      context.parent ! NeedWork(completed.data, true)
       stay using completed.data
 
     // Run was successful
@@ -461,7 +464,7 @@ class ContainerProxy(
       .flatMap { initInterval =>
         //immediately setup warmedData for use (before first execution) so that concurrent actions can use it asap
         if (initInterval.isDefined) {
-          self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1, job.gpuIds, IndexedSeq.empty[GpuId]))
+          self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1, job.gpuIds))
         }
         val parameters = job.msg.content getOrElse JsObject.empty
 

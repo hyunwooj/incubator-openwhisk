@@ -210,16 +210,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
       }
 
     // Container is free to take more work
-    case NeedWork(data: WarmedData) =>
+    case NeedWork(data: WarmedData, justInitialized: Boolean) =>
       feed ! MessageFeed.Processed
-      logging.info(this, s"NeedWork data.gpuToUse: ${data.gpusToUse}")
-      logging.info(this, s"NeedWork data.gpuToReturn: ${data.gpusToReturn}")
+      logging.info(this, s"NeedWork data.gpuIds: ${data.gpuIds}")
       logging.info(this, s"data.activeActivationCount ${data.activeActivationCount}")
       logging.info(this, s"data.action.limits.concurrency.maxConcurrent: ${data.action.limits.concurrency.maxConcurrent}")
-      data.gpusToReturn.foreach(gpuId => {
-        gpuPool = gpuPool.enqueue(gpuId)
-        logging.info(this, s"gpuPool enqueue ${gpuId}: ${gpuPool}")
-      })
+      if (!justInitialized) {
+        data.gpuIds.foreach { gpuId =>
+          gpuPool = gpuPool.enqueue(gpuId)
+          logging.info(this, s"gpuPool enqueue ${gpuId}: ${gpuPool}")
+        }
+      }
       if (data.activeActivationCount < data.action.limits.concurrency.maxConcurrent) {
         //remove from busy pool (may already not be there), put back into free pool (to update activation counts)
         freePool = freePool + (sender() -> data)
@@ -249,21 +250,39 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
       }
 
     // Container is prewarmed and ready to take work
-    case NeedWork(data: PreWarmedData) =>
+    case NeedWork(data: PreWarmedData, _) =>
       prewarmedPool = prewarmedPool + (sender() -> data)
 
     // Container got removed
     case ContainerRemoved =>
       // if container was in free pool, it may have been processing (but under capacity),
       // so there is capacity to accept another job request
-      freePool.get(sender()).foreach { f =>
+      freePool.get(sender()).foreach { data =>
+        logging.info(this, s"ContainerRemoved: In freePool, ${data}")
         freePool = freePool - sender()
-        if (f.activeActivationCount > 0) {
+        data match {
+          case WarmedData(_, _, _, _, _, gpuIds) =>
+            gpuIds.foreach { gpuId =>
+              gpuPool = gpuPool.enqueue(gpuId)
+              logging.info(this, s"gpuPool enqueue ${gpuId}: ${gpuPool}")
+            }
+          case _ =>
+        }
+        if (data.activeActivationCount > 0) {
           feed ! MessageFeed.Processed
         }
       }
       // container was busy (busy indicates at full capacity), so there is capacity to accept another job request
-      busyPool.get(sender()).foreach { _ =>
+      busyPool.get(sender()).foreach { data =>
+        logging.info(this, s"ContainerRemoved: In freePool, ${data}")
+        data match {
+          case WarmedData(_, _, _, _, _, gpuIds) =>
+            gpuIds.foreach { gpuId =>
+              gpuPool = gpuPool.enqueue(gpuId)
+              logging.info(this, s"gpuPool enqueue ${gpuId}: ${gpuPool}")
+            }
+          case _ =>
+        }
         busyPool = busyPool - sender()
         feed ! MessageFeed.Processed
       }
@@ -379,7 +398,7 @@ object ContainerPool {
                                            invocationNamespace: EntityName,
                                            idles: Map[A, ContainerData]): Option[(A, ContainerData)] = {
     idles.find {
-      case (_, WarmedData(_, `invocationNamespace`, `action`, _, activeActivationCount, _, _))
+      case (_, WarmedData(_, `invocationNamespace`, `action`, _, activeActivationCount, _))
           if activeActivationCount < action.limits.concurrency.maxConcurrent =>
         true
       case _ => false
